@@ -1,0 +1,50 @@
+- hosts: all
+  become: true
+    
+
+  vars_files:
+  - vars/all.yml
+  - vars/secrets.yml
+  
+
+  tasks:
+
+  - name: Update all packages 
+    become: true
+    apt:
+      upgrade: yes
+      update_cache: yes
+
+
+  - name: Setup OpenLDAP 
+    apt:
+      name: "{{ item }}"
+      state: present
+      update_cache: yes
+    with_items:
+      - ldap-utils
+
+  - name: install slapd
+    apt:
+      name: slapd
+      state: present
+
+
+  - name: debconf configuration for slapd
+    debconf:
+      name: slapd
+      question: "{{ item.question }}"
+      value: "{{ item.value }}"
+      vtype: "{{ item.vtype }}"
+    with_items:
+      - { question: slapd/no_configuration, value: False, vtype: boolean }
+      - { question: slapd/domain, value: "{{ domain }}", vtype: string }
+      - { question: shared/organization, value: "{{ organization }}", vtype: string }
+      - { question: slapd/password1, value: "{{ ldap_admin_pass }}", vtype: password }
+      - { question: slapd/backend, value: MDB, vtype: select }
+      - { question: slapd/purge_database, value: False, vtype: boolean }
+      - { question: slapd/move_old_database, value: True, vtype: boolean }
+    no_log: False
+
+
+

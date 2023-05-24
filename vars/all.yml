@@ -1,0 +1,10 @@
+    domain: example.com
+    organization: Organizaion
+    description: example
+    base_dn: dc=example,dc=com
+    username: user1
+
+    allowed_ips:
+      - 192.168.0.0/24
+      - 10.0.0.0/24
+   
