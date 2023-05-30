@@ -1,50 +1,256 @@
+---
 - hosts: all
+  gather_facts: no
   become: true
-    
+  
 
   vars_files:
   - vars/all.yml
   - vars/secrets.yml
-  
 
   tasks:
 
-  - name: Update all packages 
+  - name: Обновление индекса пакетов
     become: true
     apt:
       upgrade: yes
       update_cache: yes
 
+  - name: Установка Сервиса LDAP
+    package: 
+      name:
+        - slapd
+        - ldap-utils
+    become: yes
+ 
+  - name: Установка модуля python-ldap
+    package: name={{ discovered_interpreter_python | basename }}-ldap
+    become: yes
 
-  - name: Setup OpenLDAP 
-    apt:
-      name: "{{ item }}"
-      state: present
-      update_cache: yes
-    with_items:
-      - ldap-utils
-
-  - name: install slapd
-    apt:
-      name: slapd
-      state: present
+  - name: Генерация хэша пароля суперпользователя через slappasswd
+    raw: slappasswd -s {{ superuser_passwd }}
+    become: yes
+    register: hash_superuser_passwd
 
 
-  - name: debconf configuration for slapd
-    debconf:
-      name: slapd
-      question: "{{ item.question }}"
-      value: "{{ item.value }}"
-      vtype: "{{ item.vtype }}"
-    with_items:
-      - { question: slapd/no_configuration, value: False, vtype: boolean }
-      - { question: slapd/domain, value: "{{ domain }}", vtype: string }
-      - { question: shared/organization, value: "{{ organization }}", vtype: string }
-      - { question: slapd/password1, value: "{{ ldap_admin_pass }}", vtype: password }
-      - { question: slapd/backend, value: MDB, vtype: select }
-      - { question: slapd/purge_database, value: False, vtype: boolean }
-      - { question: slapd/move_old_database, value: True, vtype: boolean }
-    no_log: False
+  - name: Просмотреть хэш пароля
+    debug:
+      var: hash_superuser_passwd
+
+# В случае ошибки Insufficient access (50)
+
+#  - name: Создаем configcn.ldif
+#    copy:
+#      dest: "/vagrant/config.ldif"
+#      content: |
+#        dn: cn=config
+#        replace: olcLogLevel
+#        olcLogLevel: any
+#    become: yes
+ 
+#  - name: Изменяем cn=config database 
+#    raw: |
+#      ldapmodify -H ldapi:/// -Y EXTERNAL < "/vagrant/config.ldif"
+#    become: yes
+#    register: cnconfigout 
+
+#  - name: Смотрим вывод cnconfigout
+#    debug:
+#      var: cnconfigout
+
+
+  - name: Импорт необходимого набора схем данных
+    raw: |
+      ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/ldap/schema/cosine.ldif
+      ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/ldap/schema/nis.ldif
+      ldapadd -Y EXTERNAL -H ldapi:/// -f /etc/ldap/schema/inetorgperson.ldif
+    become: yes
+    register: schemes
+ 
+# Игнорируем ошибку ERROR: ldap_add: Other (e.g., implementation specific) error (80) Duplicate attributeType: "0.9............"
+
+    failed_when: "schemes is failed and 'Duplicate attributeType' not in schemes.stdout" 
+
+
+  - name: Определяем корневую запись DIT (Directory Information Tree) cn=config
+    ldap_entry:
+      dn: cn=config
+      objectClass: olcGlobal
+      attributes:
+        cn: config
+        olcDatabase: cn=config
+        olcPidFile: /var/run/slapd/slapd.pid
+        olcArgsFile: /var/run/slapd/slapd.args
+    become: yes
+  
+  - name: Задаём служебную базу данных конфигурации cn=config
+    ldap_entry:
+      dn: olcDatabase={0}config,cn=config
+      objectClass: olcDatabaseConfig
+      attributes:  
+        olcDatabase: "{0}config"
+        olcRootDN: cn=admin,cn=config 
+        olcRootPW: "{{ hash_superuser_passwd.stdout | trim }}"
+#       Доступ для пользователя root
+        olcAccess: to *
+          by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage     
+    become: yes
+
+#Подключение динамических модулей
+
+  - name: Создаем add-modules.ldif
+    copy:
+      dest: "/vagrant/add-modules.ldif"
+      content: |
+        dn: cn=module,cn=config
+        objectClass: olcModuleList
+        cn: module
+        olcModulePath: /usr/lib/ldap
+        olcModuleLoad: back_mdb.la
+        olcModuleLoad: back_monitor.la
+    become: yes
+ 
+  - name: Добавляем add-modules.ldif в конфигурацию
+    raw: |
+      ldapadd -QY EXTERNAL -H ldapi:/// -f /vagrant/add-modules.ldif
+    become: yes
+    register: addmoduless 
+
+# Игнорируем ошибку ldap_add: Other (e.g., implementation specific) error (80)
+
+    failed_when: "addmoduless is failed and '<olcModuleLoad> handler exited with 1' not in addmoduless.stdout" 
+
+  - name: Добавление конфигурации базы данных
+    ldap_entry:
+      dn: olcDatabase={1}mdb,cn=config
+      objectClass: olcDatabaseConfig
+      objectClass: olcMdbConfig
+      attributes:
+          olcDatabase: "{1}mdb"
+          OlcDbMaxSize: 1073741824
+          olcSuffix: dc=example,dc=com
+          olcRootDN: cn=admin,dc=example,dc=com 
+          olcRootPW: "{{ hash_superuser_passwd.stdout | trim }}"
+          olcDbDirectory: /var/lib/ldap
+          olcDbIndex: 
+            - objectClass eq
+            - uid eq
+#Политики доступа:          
+#Доступ к атрибуту userPassword. 
+#Разрешить доступ для смены пароля самим пользователем. 
+#Разрешить доступ для аутентификации. 
+#Для группы Администраторы - запись. 
+          olcAccess: to attrs=userPassword,shadowLastChange
+            by self write
+            by anonymous auth
+            by dn="cn=admin,dc=example,dc=com" write
+            by * none
+          olcAccess: to dn.base="dc=example,dc=com"
+            by dn="cn=admin,dc=example,dc=com" write
+            by * read
+    become: yes
+    register: result_add_config
+
+  - name: Создание домена
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: dc=example,dc=com
+      objectClass:
+        - top
+        - domain
+
+  - name: Создание корневой директории (Организации)
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: ou=Organization,dc=example,dc=com
+      objectClass: organizationalUnit
+
+  - name: Создание директории пользователей (контейнера для учетных записей пользователей)
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: ou=Users_Directory,ou=Organization,dc=example,dc=com
+      objectClass: organizationalUnit
+
+  - name: Создание учетной записи пользователя 1
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: uid=ivanov,ou=Users_Directory,ou=Organization,dc=example,dc=com
+      objectClass: 
+        - inetOrgPerson
+        - organizationalPerson
+        - person
+      attributes:
+        uid: ivanov 
+        cn: Ivan Ivanov
+        sn: Ivanov
+        userPassword: ivanovPassword
+
+  - name: Создание учетной записи пользователя 2
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: uid=petrov,ou=Users_Directory,ou=Organization,dc=example,dc=com
+      objectClass: 
+        - inetOrgPerson
+        - organizationalPerson
+        - person
+      attributes:
+        uid: petrov 
+        cn: Petr Petrov
+        sn: Petrov
+        userPassword: petrovvPassword
+
+  - name: Создание директории пользователей (контейнера учетных записей пользователей)
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: ou=Users_Directory,ou=Organization,dc=example,dc=com
+      objectClass: organizationalUnit
+
+  - name: Создание директории подразделения (контейнера групп)
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: ou=Department,ou=Organization,dc=example,dc=com
+      objectClass: organizationalUnit
+
+  - name: Создание группы Admins в подразделении Department
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: cn=Admins,ou=Department,ou=Organization,dc=example,dc=com
+      objectClass: posixGroup
+      attributes:
+        gidNumber: 1
+
+  - name: Создание группы Operators в подразделении Department
+    ldap_entry:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: cn=Operators,ou=Department,ou=Organization,dc=example,dc=com
+      objectClass: posixGroup
+      attributes:
+        gidNumber: 2
+
+  - name: Включение пользователя Ivanov в группу Admins в подразделении Department
+    ldap_attrs:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: cn=Admins,ou=Department,ou=Organization,dc=example,dc=com
+      attributes:
+        memberuid: ivanov
+
+  - name: Включение пользователя Petrov в группу Operators в подразделении Department
+    ldap_attrs:
+      bind_dn: cn=admin,dc=example,dc=com
+      bind_pw: "{{ superuser_passwd }}"
+      dn: cn=Operators,ou=Department,ou=Organization,dc=example,dc=com
+      attributes:
+        memberuid: petrov
 
 
 
