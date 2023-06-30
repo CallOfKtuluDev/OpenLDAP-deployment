@@ -1,0 +1,296 @@
+---
+- hosts: all
+  gather_facts: yes
+
+  
+  vars_files:
+  - vars/all.yml
+  - vars/secrets.yml
+     
+  tasks:
+
+  - name: Обновление индекса пакетов
+    apt:
+#      upgrade: yes
+      update_cache: yes
+    become: true
+
+# Предварительная настройка LDAP с помощью debconf
+
+  - name: Установка debconf-utils
+    package: name=debconf-utils
+    become: yes
+
+  - name: Проверка записей о slapd в базе debconf
+    shell: (debconf-get-selections | grep -q -s slapd); echo $?
+    register: debconf
+    ignore_errors: yes
+    become: yes
+  
+  - name: Предварительное конфигурирование slapd с помощью debconf
+    debconf:
+      name: slapd
+      question: "{{ item.question }}"
+      value: "{{ item.value }}"
+      vtype: "{{ item.vtype }}"
+    with_items:
+      - { question: slapd/no_configuration, value: True, vtype: boolean }
+    when: debconf.stdout == "1"
+    no_log: yes
+    become: yes
+
+
+# Установка LDAP 
+
+  - name: Установка Сервиса LDAP
+    package: 
+      name:
+        - slapd
+        - ldap-utils
+    become: yes
+ 
+  - name: Установка модуля python-ldap
+    package: name={{ discovered_interpreter_python | basename }}-ldap
+    become: yes
+   
+# Создание дирректории /etc/ldap/slapd.d с новыми настройками     
+
+  - name: Прооверка существования директории slapd.d 
+    stat: path=/etc/ldap/slapd.d
+    register: slapdd_stat
+
+  - name: Создание директории slapd.d 
+    file:
+      path: /etc/ldap/slapd.d
+      state: directory
+    when: slapdd_stat.stat.exists == False
+    become: yes 
+ 
+ # Создание дирректории /tmp/ldifs
+
+  - name: Прооверка существования директории /tmp/ldifs
+    stat: path=/tmp/ldif
+    register: tmpldifs_stat
+
+  - name: Создание директории /tmp/ldifs
+    file:
+      path: /tmp/ldifs
+      state: directory
+    when: tmpldifs_stat.stat.exists == False
+    become: yes 
+ 
+  
+# Инициализация каталога cn=config и служебной базы данных конфигурации cn=config
+ 
+  - name: Создаем файл конфигурации 001-init_cn_config.ldif
+    copy:
+      dest: /tmp/ldifs/001-init_cn_config.ldif
+      content: |
+        dn: cn=config
+        objectClass: olcGlobal
+        cn: config
+        olcPidFile: /var/run/slapd/slapd.pid
+        
+        dn: olcDatabase={0}config,cn=config
+        objectClass: olcDatabaseConfig
+        olcDatabase: {0}config
+        olcRootDN: cn=admin,cn=config
+        olcRootPW: secret
+        
+        dn: cn=schema,cn=config
+        objectClass: olcSchemaConfig
+        cn: schema
+       
+        include: file:///etc/ldap/schema/core.ldif
+    become: yes
+ 
+  - name: Инициализируем конфигурацию cn=config  
+    raw: |
+      slapadd -n 0 -F /etc/ldap/slapd.d -l /tmp/ldifs/001-init_cn_config.ldif
+    become: yes
+    ignore_errors: yes 
+            
+# Изменяем владельца конфигурационной директории /etc/ldap/slapd.d
+
+  - name: Меняем владельца /etc/ldap/slapd.d
+    file:
+      path: /etc/ldap/slapd.d
+      state: directory
+      recurse: yes
+      owner: openldap
+      group: openldap    
+    become: yes
+
+# Запуск сервиса LDAP
+
+  - name: Включение сервиса LDAP
+    systemd:
+      name: slapd.service
+      state: started
+      enabled: yes
+    become: yes
+          
+# Подключение динамических модулей
+
+  - name: Создаем файл динамических модулей 002-add-modules.ldif
+    copy:
+      dest: /usr/share/slapd/002-add-modules.ldif
+      content: |
+        dn: cn=module,cn=config
+        objectClass: olcModuleList
+        cn: module
+        olcModulePath: /usr/lib/ldap
+        olcModuleLoad: back_mdb.la
+        olcModuleLoad: back_monitor.la
+    become: yes
+ 
+  - name: Добавляем файл динамических модулей 002-add-modules.ldif в конфигурацию
+    raw: |
+      ldapadd -x -D "cn=admin,cn=config" -w secret -f /usr/share/slapd/002-add-modules.ldif
+      
+# Добавление наборов схемы данных
+      
+  - name: Импорт необходимого набора схем данных
+    raw: |
+      ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/cosine.ldif
+      ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/nis.ldif
+      ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/inetorgperson.ldif
+    
+# Создание директории для пользовательской базы данных     
+
+  - name: Creates directory dc=company,dc=com 
+    file:
+      path: /var/lib/ldap/dc=company,dc=com
+      state: directory
+    become: yes 
+
+# Назначаем владельца конфигурационной директории пользовательской базы данных
+
+  - name: Назначаем владельца /var/lib/ldap/dc=company,dc=com/
+    file:
+      path: /var/lib/ldap/dc=company,dc=com/
+      state: directory
+      recurse: yes
+      owner: openldap
+      group: openldap   
+      mode: 0750 
+    become: yes
+    
+# Добавление конфигурации пользовательской базы данных
+
+  - name: Создаем файл конфигурации пользовательской базы данных 003-create_user_db.ldif
+    copy:
+      dest: /tmp/ldifs/003-create_user_db.ldif
+      content: |
+       dn: olcDatabase=mdb,cn=config
+       objectClass: olcMdbConfig
+       olcDatabase: mdb
+       olcSuffix: dc=company,dc=com
+       olcDbDirectory: /var/lib/ldap/dc=company,dc=com
+       olcRootDN: cn=admin,dc=company,dc=com
+       olcRootPW: secret2
+       olcDbIndex: objectClass eq
+    become: yes
+
+# Загрузка файла конфигурации пользовательской базы данных
+
+  - name: Загружаем конфигурационный файл пользовательской базы данных olcDatabase=mdb,cn=config  
+    command: |
+      ldapadd -x -D 'cn=admin,cn=config' -w secret -f /tmp/ldifs/003-create_user_db.ldif
+    become: yes
+            
+# Инициализация пользовательской базы данных            
+            
+  - name: Создаем файл корневой записи DIT dc=company,dc=com
+    copy:
+      dest: /tmp/ldifs/004-init_user_db.ldif
+      content: |
+       dn: dc=company,dc=com
+       objectClass: organization
+       objectClass: dcObject
+       dc: company
+       o: Company
+    become: yes
+
+# Добавление корневой записи DIT dc=company,dc=com  
+ 
+  - name: Загружаем корневую запись DIT dc=company,dc=com    
+    command: |
+      ldapadd -x -D 'cn=admin,dc=company,dc=com' -w secret2 -f /tmp/ldifs/004-init_user_db.ldif
+    become: yes
+
+# Создание контейнера для учетных записей пользователей
+
+  - name: Создание контейнера для учетных записей пользователей
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: ou=Users_Directory,dc=company,dc=com
+      objectClass: organizationalUnit
+      attributes:
+        ou: Users_Directory
+
+# Создание контейнера для групп
+
+  - name: Создание контейнера для групп
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: ou=Groups_Directory,dc=company,dc=com
+      objectClass: organizationalUnit
+      attributes:
+        ou: Groups_Directory  
+        
+# Создание учетных записей пользователей
+
+  - name: Создание учетной записи пользователя 1
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: uid=ivanov,ou=Users_Directory,dc=company,dc=com
+      objectClass: inetOrgPerson
+      attributes:
+        uid: ivanov 
+        cn: Ivan Ivanov
+        sn: Ivanov
+        userPassword: ivanovPassword
+
+  - name: Создание учетной записи пользователя 2
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: uid=petrov,ou=Users_Directory,dc=company,dc=com
+      objectClass: inetOrgPerson
+      attributes:
+        uid: petrov 
+        cn: Petr Petrov
+        sn: Petrov
+        userPassword: petrovPassword
+
+# Создание группы "Администраторы" и добавление в нее пользователя 1
+
+  - name: Создание группы Администраторы
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: cn=Admins,ou=Groups_Directory,dc=company,dc=com
+      objectClass: groupOfNames
+      attributes:
+        cn: Admins
+        member: uid=ivanov,ou=Users_Directory,dc=company,dc=com
+          
+
+# Создание группы "Операторы" и добавление в нее пользователя 2
+
+  - name: Создание группы Администраторы
+    community.general.ldap_entry:
+      bind_dn: cn=admin,dc=company,dc=com
+      bind_pw: secret2
+      dn: cn=Operators,ou=Groups_Directory,dc=company,dc=com
+      objectClass: groupOfNames
+      attributes:
+        cn: Operators
+        member: uid=petrov,ou=Users_Directory,dc=company,dc=com
+          
+   
+
