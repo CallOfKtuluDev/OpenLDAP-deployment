@@ -147,7 +147,8 @@
   - name: Добавляем файл динамических модулей 002-add-modules.ldif в конфигурацию
     raw: |
       ldapadd -x -D "cn=admin,cn=config" -w secret -f /usr/share/slapd/002-add-modules.ldif
-      
+    become: yes
+    
 # Добавление наборов схемы данных
       
   - name: Импорт необходимого набора схем данных
@@ -155,6 +156,7 @@
       ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/cosine.ldif
       ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/nis.ldif
       ldapadd -x -D "cn=admin,cn=config" -w secret -f /etc/ldap/schema/inetorgperson.ldif
+    become: yes
     
 # Создание директории для пользовательской базы данных     
 
